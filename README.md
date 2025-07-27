@@ -277,8 +277,7 @@ curl http://localhost:8080/query.lua
 ```
 
 ## Contributing
-This project is open-source. Contributions, issues, and feature requests are welcome. Please check the GitHub repository for more information.
+This project is open-source under the terms of The Unlicense License. Contributions, issues, and feature requests are welcome. Please check [CONTRIBUTION](CONTRIBUTING.md) for more information.
 
 ---
-© 2025 Macrobean Contributors — MIT License
 
