@@ -1,5 +1,8 @@
+> [!WARNING]
+> macrobean have not received external security review and may contain vulnerabilities. Do not store sensitive data on it, and do not rely on its security until it has been reviewed.
+
 # Macrobean
-> A secure, portable, single-file web server with Lua scripting, SQLite support, and TLS encryption. Zero dependencies, zero installation.
+> A local, portable, single-file web server with Lua scripting, SQLite support, and TLS encryption. Zero dependencies, zero installation.
 
 Macrobean is a self-contained, single-binary web server designed for simplicity, security, and portability. It can serve static files, execute dynamic Lua scripts, query SQLite databases, and handle TLS (HTTPS) traffic without requiring any external runtimes, libraries, or configuration files.
 
@@ -11,8 +14,8 @@ It's built for developers who need to deploy simple web applications quickly, ho
 - **Database Support:** Integrated SQLite3 engine, accessible from Lua.
 - **Embedded Content:** All site files are bundled inside the executable for true portability.
 - **TLS/HTTPS:** First-class TLS support using mbedTLS.
-- **Zero Dependencies:** Runs on any modern macOS system without installation.
-- **Secure by Default:** Optional sandboxing and process-forking for enhanced security.
+- **Zero Dependencies:** Runs on macOS/Linux system without installation.
+- **Secure by Default:** Optional (recommended) sandboxing and process-forking for enhanced security.
 
 ---
 
