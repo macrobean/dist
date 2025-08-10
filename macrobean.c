@@ -19,7 +19,6 @@
 #define _GNU_SOURCE
 #endif
 #include <string.h>
-#include <stdint.h>
 
 #ifdef USE_TLS
 #include <mbedtls/net_sockets.h>
@@ -32,13 +31,6 @@
 #include <mbedtls/error.h>
 #endif
 
-#define MAX_REQ_SIZE (1024*1024) // 1 MB max request
-#define MAX_BODY_SIZE (10*1024*1024) // 10 MB max body
-#define MAX_HEADER_COUNT 50
-#define MAX_HEADER_SIZE 8192
-#define REQUEST_TIMEOUT 30
-#define MAX_CONNX 100
-#define MAX_MEMORY_USAGE (100*1024*1024) // 100 MB limit
 #define MAX_REQ 4096
 #define MAX_PATH 1024
 #define MAX_FILES 1000
@@ -64,74 +56,6 @@ mbedtls_entropy_context entropy;
 mbedtls_ctr_drbg_context ctr_drbg;
 #endif 
 
-static size_t total_allocated = 0;
-static size_t max_memory_used = 0;
-
-// memory allocation with limits
-void* safe_malloc(size_t size){
-    if(size == 0 || size > MAX_MEMORY_USAGE) return NULL;
-    if(total_allocated + size > MAX_MEMORY_USAGE)  return NULL;
-    void* ptr = malloc(size);
-    if (ptr) {
-        total_allocated += size;
-        if (total_allocated > max_memory_used)
-        max_memory_used = total_allocated;
-    }
-    return ptr;
-}
-
-void safe_free (void *ptr, size_t size){
-    if (ptr){
-        free(ptr);
-        if (total_allocated >= size) total_allocated -= size;
-    }
-}
-
-// safe string operations
-
-size_t safe_strlcpy (char *dst, const char *src, size_t size){
-    size_t src_len = strlen(src);
-    if (size == 0)
-    return src_len;
-
-
-size_t copy_len = (src_len >= size)? size - 1 : src_len;
-memcpy(dst, src, copy_len);
-dst[copy_len] = '\0';
-return src_len; 
-}
-
-// path canonicalization
-
-int canonicalization_path(const char *input, char *output, size_t output_size){
-    if (!input || !output || output_size<2) return -1;
-    const char *src = input;
-    while (*src == '/') src++;  
-    char *dst = output;
-    char *end = output + output_size - 1;
-    while (*src && dst<end){
-        if (*src == '.' && (src[1] == '/' || src[1] == '\0')) {
-        src++;
-        if (*src == '/') src++;
-        }
-        if (*src == '.' && src[1] == '.' && (src[2] == '/' || src[2] == '\0')) 
-        {
-            return -1;
-        }
-        else if (*src == '/')
-        {
-            // skip multiple slashes
-            while(*src=='/') src++;
-            if(dst > output) *dst++ = '/';
-        } else {
-            // copy regular characters
-            *dst++ = *src++;
-        }
-    }
-    *dst = '\0';
-    return 0;
-}
-
 void handle_tls_client(int client_fd);
 void handle_http_client(int client_fd);
 
@@ -155,30 +79,15 @@ const unsigned char *extract_file_data(const zip_entry_t *entry, size_t *out_siz
                entry->filename, entry->cmpr_method);
         return NULL;
     }
-
-    // bounds checking
-
-    if (entry->local_header_offset >= zip_size || 
-    entry->size > MAX_MEMORY_USAGE || 
-    entry->local_header_offset > zip_size - 30){
-        if (dev_mode) printf("DEBUG: Invalid entry bounds for '%s'\n", entry->filename);
-        return NULL;
-    }
     
     const unsigned char *local_header = zip_data + entry->local_header_offset;
     if (memcmp(local_header, "PK\003\004", 4) != 0) {
         if (dev_mode) printf("DEBUG: Invalid local file header for '%s'\n", entry->filename);
         return NULL;
     }
-    if (entry->local_header_offset + 30 > zip_size) return NULL;
+    
     unsigned short local_name_len = *(unsigned short *)(local_header + 26);
     unsigned short local_extra_len = *(unsigned short *)(local_header + 28);
-
-    // exceeding  file data zip boundaries
-    size_t data_offset = 30 + local_name_len + local_extra_len;
-    if (entry->local_header_offset + data_offset + entry -> size>zip_size) return NULL;
-
-
     const unsigned char *file_data = local_header + 30 + local_name_len + local_extra_len;
     
     *out_size = entry->size;
@@ -336,21 +245,13 @@ const char* guess_content_type(const char *path) {
 int sqlite_query(lua_State *L){
     const char *db_path=luaL_checkstring(L, 1); 
     const char *sql=luaL_checkstring(L, 2);
-    // input validation
-    if (!sql || !db_path || strlen(sql)>10000){
-        lua_pushnil(L);
-        lua_pushstring(L, "Invalid query parameters");
-        return 2;
-    }
-
     sqlite3 *db;
     if (strncmp(db_path, "site/", 5)==0){
         const zip_entry_t *entry = find_zip_entry(db_path);
         if (entry){
             size_t db_size;
             const unsigned char *db_data = extract_file_data(entry, &db_size);
-            // if(db_data && db_size > 0)
-            if(db_data && db_size > 0 && db_size < MAX_MEMORY_USAGE / 2)  // Reasonable DB size limit
+            if(db_data && db_size > 0)
             {
                 FILE *fp = fopen("/tmp/macrobean.db", "wb");
                 if(fp){
@@ -378,11 +279,7 @@ int sqlite_query(lua_State *L){
         return 2;
     }     
     int num_cols=sqlite3_column_count(stmt);
-    // limit result set size
-    int row_count = 0;
-    const int MAX_ROWS = 1000;
     while(sqlite3_step(stmt) == SQLITE_ROW){
-        if (++row_count>MAX_ROWS) break;    // Prevent memory exhaustion
         lua_newtable(L); 
         for(int i=0;i<num_cols; i++){
             const char *colname = sqlite3_column_name(stmt, i);
@@ -400,12 +297,6 @@ int sqlite_query(lua_State *L){
 int sqlite_exec(lua_State *L){
     const char *db_path=luaL_checkstring(L, 1); 
     const char *sql=luaL_checkstring(L, 2);
-    if(!db_path || !sql || strlen(sql)> 5000)
-    {
-        lua_pushnil(L);
-        lua_pushstring(L, "invalid exec parameters");
-        return 2;
-    }
     sqlite3 *db;
     char *errmsg = NULL;
     if (strncmp(db_path, "site/", 5)==0){
@@ -413,8 +304,7 @@ int sqlite_exec(lua_State *L){
         if (entry){
             size_t db_size;
             const unsigned char *db_data = extract_file_data(entry, &db_size);
-            // if(db_data && db_size > 0)
-            if(db_data && db_size > 0 && db_size < MAX_MEMORY_USAGE / 2)
+            if(db_data && db_size > 0)
             {
                 FILE *fp = fopen("/tmp/macrobean.db", "wb");
                 if(fp){
@@ -552,14 +442,10 @@ bool serve_static(int client_fd, const char *url_path, const char *method, const
     return true;
 }
 void serve_path(int client_fd, const char *url_path, const char *method, const char *body) {
-    char safe_path[MAX_PATH];
-    if (canonicalization_path(url_path, safe_path, sizeof(safe_path))!=0) {
+    if (strstr(url_path, "..")) {
         const char *err = "HTTP/1.1 400 Bad Request\r\n\r\nInvalid request path";
         write(client_fd, err, strlen(err));
         return;
-    }
-    if (strlen(safe_path) == 0){
-        safe_strlcpy(safe_path, "index.html", sizeof(safe_path));
     }
     if (dev_mode && (strcmp(url_path, "/admin")==0 || strcmp(url_path, "/admin.html")==0)){
         const zip_entry_t *admin = find_zip_entry ("site/admin.html");
@@ -580,12 +466,11 @@ write(client_fd, data, size);
 return;
     }
     char clean_path[MAX_PATH];
-    // if (url_path[0] == '/') {
-    //     strcpy(clean_path, url_path + 1);
-    // } else {
-    //     strcpy(clean_path, url_path);
-    // }
-    safe_strlcpy(clean_path,safe_path, sizeof(clean_path));
+    if (url_path[0] == '/') {
+        strcpy(clean_path, url_path + 1);
+    } else {
+        strcpy(clean_path, url_path);
+    }
     char *qs_start=strchr(clean_path, '?');
     if(qs_start) *qs_start='\0';
     if(use_lua){
