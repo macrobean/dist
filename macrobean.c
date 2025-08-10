@@ -1274,4 +1274,3 @@ void serialize_json(lua_State *L, int index, luaL_Buffer *bj){
             luaL_addstring(bj, "\"<unsupported>\"");
         }
 }
-
