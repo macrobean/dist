@@ -99,6 +99,59 @@ typedef struct connection_info {
 static connection_info_t *conenctions = NULL;
 static int active_connections = 0;
 
+// rate limiting check
+int check_rate_limit(const char *client_ip){
+    time_t now = time(NULL);
+    connection_info_t *conn = connections;
+
+    // find existing connection
+    while(conn) {
+        if (strcmp(conn->client_ip, client_ip) == 0){
+            // counter resets every 60 secs
+            if (now - conn->last_reques > 60) {
+                conn->request_count = 0;
+            }
+            conn->last_request = now;
+            conn->request_count++;
+
+            // allow max 100 req/min
+            return (conn->request_count <= MAX_CONNX)? 1:0;
+        }
+        conn = conn->next;
+    }
+
+    // new connection 
+    if (active_connections >= MAX_CONNX) return 0;
+    conn = safe_malloc(size_of(connection_info_t));
+    if(!conn) return 0;
+
+    safe_strlcpy(conn->client_ip, client_ip, sizeof(conn->client_ip));
+    conn->last_request = now;
+    conn->request_count = 1;
+    conn->next = connections;
+    connections = conn;
+    active_connections++;
+
+    return 1;
+}
+
+// clean up old connections
+
+void cleanup_connections(){
+    time_t now = time(NULL);
+    connection_info_t **current = &connections;
+
+    while (*current){
+        if(now - (*current)->last_request > 300) {
+            connection_info_t *to_remove = *current;
+            *current = to_remove->next;
+            safe_free(to_remove, sizeof(connection_info_t));
+            active_connections--;
+        }
+        else current = &(*current)->next;
+    }
+}
+
 // memory allocation with limits
 void* safe_malloc(size_t size){
     if(size == 0 || size > MAX_MEMORY_USAGE) return NULL;
