@@ -67,6 +67,38 @@ mbedtls_ctr_drbg_context ctr_drbg;
 static size_t total_allocated = 0;
 static size_t max_memory_used = 0;
 
+// request parsing and validation structures
+typedef struct {
+    char method[16];
+    char path[MAX_PATH];
+    char version[16];
+    char headers[MAX_HEADER_COUNT][MAX_HEADER_SIZE];
+    int header_count;
+    char *body;
+    size_t body_length;
+    size_t content_length;
+    int keep_alive;
+    time_t timestamp;
+} http_request_t;
+typedef struct {
+    int status_code;
+    char content_type[128];
+    char *body;
+    size_t body_length;
+    char headers[MAX_HEADER_COUNT][MAX_HEADER_SIZE];
+    int header_count;
+} http_response_t;
+// connection tracking for rate limiting
+typedef struct connection_info {
+    char client_ip[INET_ADDRSTRLEN];
+    time_t last_request;
+    int request_count;
+    struct connection_info *next;
+} connection_info_t;
+
+static connection_info_t *conenctions = NULL;
+static int active_connections = 0;
+
 // memory allocation with limits
 void* safe_malloc(size_t size){
     if(size == 0 || size > MAX_MEMORY_USAGE) return NULL;
