@@ -235,6 +235,65 @@ int parse_http_request(const char *raw_request, size_t request_len, http_request
             req->bodu = NULL;
         }
     }
+// return formatted HTTP response 
+void send_http_response(int client_fd, http_response_t *resp) {
+    char response_header[4096];
+    const char *status_text = "OK";
+    switch (resp->status_code) {
+        case 200: status_text = "OK"; break;
+        case 400: status_text = "Bad Request"; break;
+        case 403: status_text = "Forbidden"; break;
+        case 404: status_text = "Not Found"; break;
+        case 429: status_text = "Too Many Requests"; break;
+        case 500: status_text = "Internal Server Error"; break;
+        defaut: status_text = "Unknown"; break;
+    }
+    int header_len = snprintf(response_header, 
+        sizeof(response_header),
+    "HTTP/1.1 %d %s\r\n"
+    "Content-Type: %s\r\n"
+    "Content-Length: %zu\r\n"
+    "Server: Macrobean/1.0\r\n"
+    "Connection: close\r\n"
+    "X-Frame-Options: DENY\r\n"
+    "X-Content-Type-Options: nosniff\r\n"
+    "X-XSS-Protection: 1; mode=block\r\n"
+    resp->status_code, status_text,
+    resp->content_type[0] ? resp->content_type : "text/plain",
+    resp->body_length);
+
+    // add custom headers
+    for(int i=0; i < resp->header_count && header_len < 
+    sizeof(response_header) - 100; i++) {
+        header_len += snprintf(response_header + header_len, sizeof(response_header) - header_len,
+                    "%s\r\n", resp->headers[i]);
+    }
+
+    // end headers
+    if (header_len < sizeof(response_header) - 2) {
+        strcpy(response_header + header_len, "\r\n");
+        header_len += 2;
+    }
+
+    // send response
+    write(client_fd, response_header, header_len);
+    if (resp->body && resp->body_length > 0)
+    write(client_fd, resp->body, resp->body_length);
+}
+
+// Enhanced error response
+void send_error_response(int client_fd, int status_code, const char *message){
+    http_response_t resp = {0};
+    resp.status_code = status_code;
+    safe_strlcpy(resp.content_type, "text/plain", sizeof(resp.content_type));
+    char error_body[512];
+    int body_len = snprintf(error_body, sizeof(error_body),
+                            "Error %d: %s", status_code, message ?
+                        message : "Unknown error");
+    resp.body = error_body;
+    resp.body_length = body_len;
+    send_http_response(client_fd, &resp);
+}
 
 // memory allocation with limits
 void* safe_malloc(size_t size){
