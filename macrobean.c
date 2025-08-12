@@ -152,6 +152,90 @@ void cleanup_connections(){
     }
 }
 
+int parse_http_request(const char *raw_request, size_t request_len, http_request_t *req){
+    if(!raw_request || !req || request_len == 0 || request_len > MAX_REQ_SIZE){
+        return -1;
+    }
+    memset(req, 0, sizeof(http_request_t));
+    req->timestamp = time(NULL);
+    // find request line end
+    const char *line_end = strstr(raw_request, "\r\n");
+    if(!line_end) return -1;
+    // parse request line
+    char request_line[512];
+    size_t line_len = line_end - raw_request;
+    if (line_len >= sizeof(request_line)) return -1;
+    memcpy(request_line, raw_request, line_len);
+    request_line[line_len] = '\0';
+    if (sscanf(request_line, "%15s %1023s %15s", req->method, req->path, req->version) != 3){
+        return -1;
+    }
+    
+    // validate method
+    if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "POST") !=0 && strcmp(req->method, "HEAD") !=0 && strcmp(req->method, "OPTIONS") != 0) {
+        return -1;
+    }
+
+    // validate HTTP version
+    if(strcmp(req->version, "HTTP/1.0") != 0 && strcmp(req->version, "HTTP/1.1") != 0){
+        return -1;
+    }
+
+    // parse headers 
+    const char *header_start = line_end + 2;
+    const char *headers_end = strstr(header_start, "\r\n\r\n");
+    if(!headers_end) return -1;
+
+    const char *current = header_start;
+    req->header_count = 0;
+
+    while(current < headers_end && req->header_count < MAX_HEADER_COUNT) {
+        const char *header_end = strstr(current, "\r\n");
+        if (!header_end) break;
+        size_t header_len = header_end - current;
+        if (header_len >= MAX_HEADER_SIZE) {
+            current = header_end + 2;
+            continue;
+        }
+
+        memcpy(req->headers[req->header_count], current, header_len);
+        req->headers[req->header_count][header_len] = '\0';
+
+        // parse Content-length
+        if(strncasecmp(current, "Content-Length:", 15) == 0){
+            sscanf(current + 15, "%zu", &req->content_length);
+            if (req->content_length > MAX_BODY_SIZE) return -1;
+        }
+
+        // parse connection header
+        if (strncasecmp(current, "Connection:", 11) == 0){
+            if (strcasestr(current + 11, "keep-alive")) {
+                req->keep_alive = 1;
+            }
+        }
+        req -> header_count++;
+        current = header_end + 2;
+    }
+    // handle body if present
+    if (req->content_length > 0){
+        const char *body_start = headers_end + 4;
+        size_t available_body = request_len - (body_start - raw_request);
+        if (available_body < req->content_length) return -2;    // incomplete body
+        req->body = safe_malloc(req->content_length + 1);
+        if(!req->body) return -1;
+        memcpy(req->body, body_start, req->content_length);
+        req->body[req->content_length] = '\0';
+        req->body_length = req->content_length;
+    }
+    return 0;
+}
+    void free_http_request(http_request_t *req) {
+        if (req && req->body) {
+            safe_free(req->body, req->body_length);
+            req->bodu = NULL;
+        }
+    }
+
 // memory allocation with limits
 void* safe_malloc(size_t size){
     if(size == 0 || size > MAX_MEMORY_USAGE) return NULL;
