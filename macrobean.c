@@ -44,6 +44,7 @@
 #define MAX_FILES 1000
 #define PORT 8080
 #define SANDBOX_LIMIT 1000000
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 int dev_mode=0, use_fork=0, use_lua=0, use_db=0;
 unsigned char *zip_data = NULL;
 size_t zip_size = 0;
@@ -96,8 +97,73 @@ typedef struct connection_info {
     struct connection_info *next;
 } connection_info_t;
 
-static connection_info_t *conenctions = NULL;
+static connection_info_t *connections = NULL;
 static int active_connections = 0;
+
+// memory allocation with limits
+void* safe_malloc(size_t size){
+    if(size == 0 || size > MAX_MEMORY_USAGE) return NULL;
+    if(total_allocated + size > MAX_MEMORY_USAGE)  return NULL;
+    void* ptr = malloc(size);
+    if (ptr) {
+        total_allocated += size;
+        if (total_allocated > max_memory_used)
+        max_memory_used = total_allocated;
+    }
+    return ptr;
+}
+
+void safe_free (void *ptr, size_t size){
+    if (ptr){
+        free(ptr);
+        if (total_allocated >= size) total_allocated -= size;
+    }
+}
+
+// safe string operations
+
+size_t safe_strlcpy (char *dst, const char *src, size_t size){
+    size_t src_len = strlen(src);
+    if (size == 0)
+    return src_len;
+
+
+size_t copy_len = (src_len >= size)? size - 1 : src_len;
+memcpy(dst, src, copy_len);
+dst[copy_len] = '\0';
+return src_len; 
+}
+
+// path canonicalization
+
+int canonicalization_path(const char *input, char *output, size_t output_size){
+    if (!input || !output || output_size<2) return -1;
+    const char *src = input;
+    while (*src == '/') src++;  
+    char *dst = output;
+    char *end = output + output_size - 1;
+    while (*src && dst<end){
+        if (*src == '.' && (src[1] == '/' || src[1] == '\0')) {
+        src++;
+        if (*src == '/') src++;
+        }
+        if (*src == '.' && src[1] == '.' && (src[2] == '/' || src[2] == '\0')) 
+        {
+            return -1;
+        }
+        else if (*src == '/')
+        {
+            // skip multiple slashes
+            while(*src=='/') src++;
+            if(dst > output) *dst++ = '/';
+        } else {
+            // copy regular characters
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    return 0;
+}
 
 // rate limiting check
 int check_rate_limit(const char *client_ip){
@@ -108,7 +174,7 @@ int check_rate_limit(const char *client_ip){
     while(conn) {
         if (strcmp(conn->client_ip, client_ip) == 0){
             // counter resets every 60 secs
-            if (now - conn->last_reques > 60) {
+            if (now - conn->last_request > 60) {
                 conn->request_count = 0;
             }
             conn->last_request = now;
@@ -122,7 +188,7 @@ int check_rate_limit(const char *client_ip){
 
     // new connection 
     if (active_connections >= MAX_CONNX) return 0;
-    conn = safe_malloc(size_of(connection_info_t));
+    conn = safe_malloc(sizeof(connection_info_t));
     if(!conn) return 0;
 
     safe_strlcpy(conn->client_ip, client_ip, sizeof(conn->client_ip));
@@ -232,7 +298,7 @@ int parse_http_request(const char *raw_request, size_t request_len, http_request
     void free_http_request(http_request_t *req) {
         if (req && req->body) {
             safe_free(req->body, req->body_length);
-            req->bodu = NULL;
+            req->body = NULL;
         }
     }
 // return formatted HTTP response 
@@ -257,7 +323,7 @@ void send_http_response(int client_fd, http_response_t *resp) {
     "Connection: close\r\n"
     "X-Frame-Options: DENY\r\n"
     "X-Content-Type-Options: nosniff\r\n"
-    "X-XSS-Protection: 1; mode=block\r\n"
+    "X-XSS-Protection: 1; mode=block\r\n",
     resp->status_code, status_text,
     resp->content_type[0] ? resp->content_type : "text/plain",
     resp->body_length);
@@ -293,71 +359,6 @@ void send_error_response(int client_fd, int status_code, const char *message){
     resp.body = error_body;
     resp.body_length = body_len;
     send_http_response(client_fd, &resp);
-}
-
-// memory allocation with limits
-void* safe_malloc(size_t size){
-    if(size == 0 || size > MAX_MEMORY_USAGE) return NULL;
-    if(total_allocated + size > MAX_MEMORY_USAGE)  return NULL;
-    void* ptr = malloc(size);
-    if (ptr) {
-        total_allocated += size;
-        if (total_allocated > max_memory_used)
-        max_memory_used = total_allocated;
-    }
-    return ptr;
-}
-
-void safe_free (void *ptr, size_t size){
-    if (ptr){
-        free(ptr);
-        if (total_allocated >= size) total_allocated -= size;
-    }
-}
-
-// safe string operations
-
-size_t safe_strlcpy (char *dst, const char *src, size_t size){
-    size_t src_len = strlen(src);
-    if (size == 0)
-    return src_len;
-
-
-size_t copy_len = (src_len >= size)? size - 1 : src_len;
-memcpy(dst, src, copy_len);
-dst[copy_len] = '\0';
-return src_len; 
-}
-
-// path canonicalization
-
-int canonicalization_path(const char *input, char *output, size_t output_size){
-    if (!input || !output || output_size<2) return -1;
-    const char *src = input;
-    while (*src == '/') src++;  
-    char *dst = output;
-    char *end = output + output_size - 1;
-    while (*src && dst<end){
-        if (*src == '.' && (src[1] == '/' || src[1] == '\0')) {
-        src++;
-        if (*src == '/') src++;
-        }
-        if (*src == '.' && src[1] == '.' && (src[2] == '/' || src[2] == '\0')) 
-        {
-            return -1;
-        }
-        else if (*src == '/')
-        {
-            // skip multiple slashes
-            while(*src=='/') src++;
-            if(dst > output) *dst++ = '/';
-        } else {
-            // copy regular characters
-            *dst++ = *src++;
-        }
-    }
-    *dst = '\0';
-    return 0;
 }
 
 void handle_tls_client(int client_fd);
@@ -1204,46 +1205,91 @@ void handle_tls_client(int client_fd){
     close(client_fd);
 }
 #endif
+    
+void handle_http_client(int client_fd) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        char client_ip[INET_ADDRSTRLEN] = {0};
 
-void handle_http_client(int client_fd){
-    char request[MAX_REQ] = {0};
-    ssize_t total_read = 0, bytes_read = 0;
-    while ((bytes_read = read(client_fd, request + total_read, MAX_REQ - total_read - 1)) > 0) {
-        total_read += bytes_read;
-        request[total_read] = '\0';
-        if (strstr(request, "\r\n\r\n")) break;
+        // get client IP for rate limiting
+        if (getpeername(client_fd, (struct sockaddr*)&client_addr, 
+    &addr_len) == 0){
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, 
+        INET_ADDRSTRLEN);
+    } else {
+        strcpy(client_ip, "unknown");
     }
-
-    char method[16] = {0}, path[MAX_PATH] = {0}, version[16] = {0};
-    char *body = NULL;
-    if (sscanf(request, "%15s %1023s %15s", method, path, version) == 3) {
-        int content_length = 0;
-        char *cl = strcasestr(request, "Content-Length:");
-        if (cl) sscanf(cl, "Content-Length: %d", &content_length);
-
-        char *header_end = strstr(request, "\r\n\r\n");
-        char *body_start = header_end ? header_end + 4 : NULL;
-        int body_bytes_read = total_read - (body_start - request);
-
-        if (content_length > 0) {
-            body = malloc(content_length + 1);
-            if (body_start && body_bytes_read > 0)
-                memcpy(body, body_start, body_bytes_read);
-
-            while (body_bytes_read < content_length) {
-                ssize_t br = read(client_fd, body + body_bytes_read,
-                                 content_length - body_bytes_read);
-                if (br <= 0) break;
-                body_bytes_read += br;
-            }
-            body[content_length] = '\0';
+    
+    // rate limiting check
+    if (!check_rate_limit(client_ip)) {
+        send_error_response(client_fd, 429, "Rate limit exceeded");
+        close(client_fd);
+        return;
         }
-        serve_path(client_fd, path, method, body);
-        if (body) free(body);
-    }
+        // set socket timeout
+        struct timeval timeout;
+        timeout.tv_sec = REQUEST_TIMEOUT;
+        timeout.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        char *request_buffer = safe_malloc(MAX_REQ_SIZE);
+        if(!request_buffer) {
+            send_error_response(client_fd, 500, "Memory allocation failed");
+            close(client_fd);
+            return;
+        }
+        ssize_t total_read = 0, bytes_read = 0;
+                // read request with bounds checking
+                while (total_read < MAX_REQ_SIZE - 1){
+                    bytes_read = read(client_fd, request_buffer + total_read,
+                    MAX_REQ_SIZE - total_read - 1);
+                    if (bytes_read <= 0) break;
+                    total_read += bytes_read;
+                    request_buffer[total_read] = '\0';
+                    if (strstr(request_buffer, "\r\n\r\n")) break;
+            }
+        if (total_read == 0){
+        safe_free (request_buffer, MAX_REQ_SIZE);
+        close(client_fd);
+        return;
+        }
+
+        // parse HTTP request
+        http_request_t req;
+        int parse_result = parse_http_request(request_buffer, total_read, &req);
+        if(parse_result == -2) {
+            // incomplete body, try to read more
+            const char *headers_end = strstr(request_buffer, "\r\n\r\n");
+            if (headers_end) {
+                size_t headers_len = (headers_end + 4) - request_buffer;
+                size_t body_needed = req.content_length;
+                size_t body_received = total_read - headers_len;
+
+                while (body_received < body_needed && total_read < MAX_REQ_SIZE - 1) {
+                    bytes_read = read(client_fd, request_buffer + total_read,
+                    MIN(body_needed - body_received, MAX_REQ_SIZE - total_read - 1));
+                    if (bytes_read <= 0) break;
+                    total_read += bytes_read;
+                    body_received += bytes_read;
+                }
+
+                // re-parse with complete request
+                parse_result = parse_http_request(request_buffer, total_read, &req);
+            }
+        }
+        safe_free(request_buffer, MAX_REQ_SIZE);
+        if (parse_result!=0) {
+            send_error_response(client_fd, 400, "Invalid HTTP request");
+            close(client_fd);
+            return;
+        }
+
+        if (dev_mode) {
+            printf("Request: %s %s from %s\n", req.method, req.path, client_ip);
+        }
+    serve_path (client_fd, req.path, req.method, req.body);
+    free_http_request(&req);
     close(client_fd);
 }
-
 int main(int argc, char **argv) {
     int port = PORT;
     for(int i=1;i<argc;i++){
