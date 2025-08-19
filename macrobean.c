@@ -312,7 +312,7 @@ void send_http_response(int client_fd, http_response_t *resp) {
         case 404: status_text = "Not Found"; break;
         case 429: status_text = "Too Many Requests"; break;
         case 500: status_text = "Internal Server Error"; break;
-        defaut: status_text = "Unknown"; break;
+        default: status_text = "Unknown"; break;
     }
     int header_len = snprintf(response_header, 
         sizeof(response_header),
@@ -329,7 +329,7 @@ void send_http_response(int client_fd, http_response_t *resp) {
     resp->body_length);
 
     // add custom headers
-    for(int i=0; i < resp->header_count && header_len < 
+    for(size_t i=0; i < (size_t)resp->header_count && header_len < 
     sizeof(response_header) - 100; i++) {
         header_len += snprintf(response_header + header_len, sizeof(response_header) - header_len,
                     "%s\r\n", resp->headers[i]);
@@ -361,7 +361,9 @@ void send_error_response(int client_fd, int status_code, const char *message){
     send_http_response(client_fd, &resp);
 }
 
+#ifdef USE_TLS
 void handle_tls_client(int client_fd);
+#endif
 void handle_http_client(int client_fd);
 
 int lua_json(lua_State *L);
