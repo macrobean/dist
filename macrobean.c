@@ -597,7 +597,7 @@ int sqlite_query(lua_State *L){
         lua_pushstring(L, sqlite3_errmsg(db));
         return 2;
     }
-    char *errmsg = NULL;
+    // char *errmsg = NULL;
     lua_newtable(L); 
     int row_idx = 1;
     sqlite3_stmt *stmt;
@@ -836,7 +836,7 @@ return;
         if(query_start && *(query_start+1) != '\0'){
             char *query_dup=strdup(query_start+1);
             if(query_dup){
-                char *saveptr = NULL;
+                // char *saveptr = NULL;
                 char *pair=strtok(query_dup,"&");
                 while(pair){
                 char *eq=strchr(pair,'=');
@@ -1402,7 +1402,7 @@ int main(int argc, char **argv) {
         printf("  - %s\n", zip_contents[i].filename);
     } printf("\npress ctrl+c to stop\n\n");
     fd_set readfds;
-    int maxfd=fd;
+    // int maxfd=fd;
     signal(SIGCHLD, SIG_IGN); // auto reap child
     while(1){
         FD_ZERO(&readfds);
