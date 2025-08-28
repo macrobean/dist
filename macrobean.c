@@ -15,6 +15,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <errno.h>
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -45,7 +48,7 @@
 #define PORT 8080
 #define SANDBOX_LIMIT 1000000
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-int dev_mode=0, use_fork=0, use_lua=0, use_db=0;
+int dev_mode=0, use_fork=0, use_lua=0, use_db=0, use_workers=0;
 unsigned char *zip_data = NULL;
 size_t zip_size = 0;
 long zip_start_offset = 0; 
@@ -56,6 +59,10 @@ static time_t last_db_reload=0;
 int use_tls=0;
 const char *tls_cert_path = NULL ;
 const char *tls_key_path = NULL;
+int worker_count = 10;
+int worker_max_requests = 1000;
+size_t worker_memory_limit = (10*1024*1024);
+int worker_nofile_limit = 100;
 #ifdef USE_TLS
 mbedtls_ssl_context ssl;
 mbedtls_ssl_config conf;
@@ -365,6 +372,7 @@ void send_error_response(int client_fd, int status_code, const char *message){
 void handle_tls_client(int client_fd);
 #endif
 void handle_http_client(int client_fd);
+void worker_loop(int listen_fd);
 
 int lua_json(lua_State *L);
 void serialize_json(lua_State *L, int index, luaL_Buffer *bj);
@@ -916,14 +924,11 @@ return;
     lua_getglobal(L, "find_route");
     lua_pushstring(L, route_key);
     lua_call(L, 1, 2);
-    if(!lua_isfunction(L, -2)){
+    if (!lua_isfunction(L, -2)) {
         if (dev_mode) fprintf(stderr, "No function handler returned for %s\n", route_key);
         lua_pop(L, 2);
         lua_close(L);
         if (serve_static(client_fd, url_path, method, body)) return;
-        const char *resp = "HTTP/1.1 404 Not Found\r\n\r\nNo matching route or fallback";
-        write(client_fd, resp, strlen(resp));
-        return;
     }
     else if (lua_isfunction(L, -2)){
             if(dev_mode) printf("Matched pattern route: %s\n", route_key);
@@ -1120,6 +1125,81 @@ int load_zip_from_self(const char *self_path) {
 }
 char *zip_override_path = NULL;
 
+/* Worker accept loop: runs inside each worker process */
+void worker_loop(int listen_fd) {
+    struct rlimit rl;
+/* Portable memory limits: 
+    - Linux: RLIMIT_AS
+    - macOS/BSD fallback: RLIMIT_DATA (and try RLIMIT_RSS) */
+#if defined(__APPLE__)
+    if (dev_mode) {
+        fprintf(stderr, "[warn] RLIMIT_AS / RLIMIT_DATA not supported on macOS, skipping memory limit\n");
+    }
+#elif defined(RLIMIT_AS)
+    rl.rlim_cur = rl.rlim_max = worker_memory_limit;
+    if (setrlimit(RLIMIT_AS, &rl) != 0 && dev_mode) {
+        perror("setrlimit(RLIMIT_AS)");
+    }
+#elif defined(RLIMIT_DATA)
+    rl.rlim_cur = rl.rlim_max = worker_memory_limit;
+    if (setrlimit(RLIMIT_DATA, &rl) != 0 && dev_mode) {
+        perror("setrlimit(RLIMIT_DATA)");
+    }
+#endif
+    // limit cpu seconds
+#if defined(RLIMIT_RSS)
+    rl.rlim_cur = rl.rlim_max = 10; /* 10 seconds CPU time per process */
+    (void)setrlimit(RLIMIT_RSS, &rl);
+#endif
+#if defined(RLIMIT_CPU)
+    rl.rlim_cur = rl.rlim_max = 10;
+    if (setrlimit(RLIMIT_CPU, &rl) != 0 && dev_mode) perror("setrlimit(RLIMIT_CPU)");
+#endif
+
+/* limit file descriptors */
+    rl.rlim_cur = rl.rlim_max = worker_nofile_limit;
+    if (setrlimit(RLIMIT_NOFILE, &rl)!=0 && dev_mode) {
+        perror("setrlimit(RLIMIT_NOFILE)");
+    }
+    int request_counter = 0;
+    fd_set readfds;
+    while (1) {
+        if (request_counter >= worker_max_requests) {
+            if (dev_mode) 
+            fprintf(stderr, "Worker %d reached max requests (%d), exiting for recycle\n", getpid(), worker_max_requests);
+            _exit(0);
+        }
+
+        FD_ZERO(&readfds);
+        FD_SET(listen_fd, &readfds);
+        int ready = select (listen_fd + 1, &readfds, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            if (dev_mode) perror("select");
+            continue;
+        }
+        if (FD_ISSET(listen_fd, &readfds)) {
+            int client_fd = accept(listen_fd, NULL, NULL);
+            if (client_fd < 0) {
+                if (errno == EINTR) continue;
+                if (dev_mode) perror("accept");
+                continue;
+            }
+
+            #ifdef USE_TLS
+            if (use_tls) {
+                handle_tls_client(client_fd);
+            } else {
+                handle_http_client(client_fd);
+            }
+            #else
+            handle_http_client(client_fd);
+            #endif
+            close(client_fd);
+            request_counter++;
+        }
+    }
+}
 #ifdef USE_TLS
 void init_tls_server(){
 const char *pers = "macrobean_tls";
@@ -1207,7 +1287,7 @@ void handle_tls_client(int client_fd){
     close(client_fd);
 }
 #endif
-    
+
 void handle_http_client(int client_fd) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
@@ -1294,15 +1374,18 @@ void handle_http_client(int client_fd) {
 }
 int main(int argc, char **argv) {
     int port = PORT;
-    for(int i=1;i<argc;i++){
-        if(!strcmp(argv[i], "--help")|| !strcmp(argv[i], "-h")){
+
+    /* parse arguments */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("Macrobean - Single-binary Web Server\n\n");
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
             printf(" --help, -h       Show this help message\n");
-            printf(" --port <number>  Use custom port instead of default (%d)\n",PORT);
-            printf(" --dev            Enable dev mode \n");
+            printf(" --port <number>  Use custom port instead of default (%d)\n", PORT);
+            printf(" --dev            Enable dev mode\n");
             printf(" --fork           Enable fork() mode per request\n");
+            printf(" --workers N      Pre-fork worker pool mode with N workers\n");
             printf(" --zip <file>     Use external zip file instead of embedded\n");
             printf(" --lua            Enable lua script execution for .lua files (sandboxed)\n");
             printf(" --db             Enable sqlite database for .db files\n");
@@ -1313,169 +1396,248 @@ int main(int argc, char **argv) {
             printf(" --watch          Auto-reload ZIP + DB (dev only)\n");
             printf(" --bundle         Build final .com release\n");
             return 0;
-        } else if(!strcmp(argv[i], "--port")) {
-            if(i+1<argc) port=atoi(argv[++i]);
-        else {fprintf(stderr, "Error: --port requires a number\n");return 1;} }
-        else if (!strcmp(argv[i], "--dev")) dev_mode=1;
-        else if (!strcmp(argv[i], "--lua")) use_lua=1;
-        else if (!strcmp(argv[i], "--db")) use_db=1;
-        else if (!strcmp(argv[i], "--sandbox")) sandbox_mode=true;
-        else if (!strcmp(argv[i], "--cert") && i+1 < argc) tls_cert_path=argv[++i];
-        else if (!strcmp(argv[i], "--key") && i+1 < argc) tls_key_path=argv[++i];  
+        }
+        else if (!strcmp(argv[i], "--port")) {
+            if (i + 1 < argc) port = atoi(argv[++i]);
+            else { fprintf(stderr, "Error: --port requires a number\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--dev")) dev_mode = 1;
+        else if (!strcmp(argv[i], "--lua")) use_lua = 1;
+        else if (!strcmp(argv[i], "--db")) use_db = 1;
+        else if (!strcmp(argv[i], "--sandbox")) sandbox_mode = true;
+        else if (!strcmp(argv[i], "--cert") && i + 1 < argc) tls_cert_path = argv[++i];
+        else if (!strcmp(argv[i], "--key") && i + 1 < argc) tls_key_path = argv[++i];
         else if (!strcmp(argv[i], "--watch")) {
             watch_mode = true;
             dev_mode = true;
         }
-        else if (!strcmp(argv[i], "--zip")) 
-        {
-            if(i+1<argc)
-            zip_override_path=argv[++i];
+        else if (!strcmp(argv[i], "--workers")) {
+            if (i + 1 < argc) {
+                worker_count = atoi(argv[++i]);
+                if (worker_count <= 0) worker_count = 1;
+                use_workers = 1;
+            } else {
+                fprintf(stderr, "Error: --workers requires a number\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--zip")) {
+            if (i + 1 < argc) zip_override_path = argv[++i];
+            else {
+                fprintf(stderr, "Error: --zip requires a path to a .zip file\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--fork")) use_fork = 1;
+        else if (!strcmp(argv[i], "--tls")) use_tls = true;
         else {
-            fprintf(stderr, "Error: --zip requires a path to a .zip uncompressed file\n");
-        }
-        }
-        else if(!strcmp(argv[i], "--fork")) use_fork=1;
-        else
-        {
-            fprintf(stderr, "Unknown argument: %s\nuse --help to see available options", argv[i]); return 1;
+            fprintf(stderr, "Unknown argument: %s\nuse --help to see available options\n", argv[i]);
+            return 1;
         }
     }
-    #ifdef USE_TLS
-    if (use_tls){
-        if(!tls_cert_path || !tls_key_path)
-        {
+
+#ifdef USE_TLS
+    if (use_tls) {
+        if (!tls_cert_path || !tls_key_path) {
             if (dev_mode) {
-                fprintf(stderr, "[dev] TLS cert/key missisng, falling back to HTTP\n");
-                use_tls=false;
-            }
-            else {
+                fprintf(stderr, "[dev] TLS cert/key missing, falling back to HTTP\n");
+                use_tls = false;
+            } else {
                 fprintf(stderr, "TLS enabled but cert/key missing\n");
                 exit(1);
             }
-        } init_tls_server();
+        }
+        init_tls_server();
     }
-    #endif
+#endif
 
     printf("Running Macrobean Server\n");
-    if (dev_mode)
-    printf("Extracting embedded content...\n");
-    if (zip_override_path){
+    if (dev_mode) printf("Extracting embedded content...\n");
+
+    /* load ZIP data */
+    if (zip_override_path) {
         FILE *fp = fopen(zip_override_path, "rb");
-        if(!fp){fprintf(stderr, "Error: Cannot open ZIP: %s\n", zip_override_path);
-        return 1;}
-        fseek(fp,0,SEEK_END);
-        zip_size=ftell(fp);
+        if (!fp) { fprintf(stderr, "Error: Cannot open ZIP: %s\n", zip_override_path); return 1; }
+        fseek(fp, 0, SEEK_END);
+        zip_size = ftell(fp);
         rewind(fp);
-        zip_data=malloc(zip_size);
-        if(!zip_data){
-            fprintf(stderr, "Error: not enough memory to load ZIP\n"); 
-            fclose(fp); 
+        zip_data = malloc(zip_size);
+        if (!zip_data) {
+            fprintf(stderr, "Error: not enough memory to load ZIP\n");
+            fclose(fp);
             return 1;
         }
         fread(zip_data, 1, zip_size, fp);
         fclose(fp);
-       if (dev_mode) fprintf(stderr, "Loaded external ZIP: %s (%zu bytes)\n",zip_override_path,zip_size);
-       discover_zip_structure();
-    } 
+        if (dev_mode) fprintf(stderr, "Loaded external ZIP: %s (%zu bytes)\n", zip_override_path, zip_size);
+        discover_zip_structure();
+    }
     else {
-        if(dev_mode)
-        fprintf(stderr, "No external ZIP provided. Falling back to embedded ZIP.\n");
+        if (dev_mode) fprintf(stderr, "No external ZIP provided. Falling back to embedded ZIP.\n");
         load_zip_from_self(argv[0]);
     }
-    printf("successfully fetched %d files from embedded archive\n", zip_entry_cnt);
+
+    printf("successfully fetched %d files from archive\n", zip_entry_cnt);
+
+    /* setup listening socket */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket failed"); return 1; }
     int opt = 1;
-    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in addr = {.sin_family = AF_INET,.sin_addr.s_addr = INADDR_ANY,.sin_port = htons(port)};
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind failed");
         return 1;
     }
-    
-    if (listen(fd, 10) < 0) {
+    if (listen(fd, 128) < 0) {
         perror("listen failed");
         return 1;
     }
+
     printf("server running on http://localhost:%d\n", port);
     printf("available files:\n");
-    for (int i =0; i<zip_entry_cnt;i++) {
+    for (int i = 0; i < zip_entry_cnt; i++) {
         printf("  - %s\n", zip_contents[i].filename);
-    } printf("\npress ctrl+c to stop\n\n");
-    fd_set readfds;
-    // int maxfd=fd;
-    signal(SIGCHLD, SIG_IGN); // auto reap child
-    while(1){
-        FD_ZERO(&readfds);
-        FD_SET(fd, &readfds);
-        int ready=select(fd+1, &readfds, NULL, NULL, NULL);
-        if (ready<0)
-        {
-            if(dev_mode) perror("select()");
-            continue;
+    }
+    printf("\npress ctrl+c to stop\n\n");
+
+    /* worker pool mode */
+    if (use_workers) {
+        pid_t *child_pids = calloc(worker_count, sizeof(pid_t));
+        if (!child_pids) {
+            fprintf(stderr, "Error: cannot allocate child pid table\n");
+            return 1;
         }
-        if(FD_ISSET(fd, &readfds)){
-            int client_fd=accept(fd, NULL, NULL);
-            if(client_fd<0) continue;
-            if(use_fork){
-                pid_t pid = fork();
-                if (pid==0){
-                    close(fd);
-                    if(use_tls) handle_tls_client(client_fd);
-                    else handle_http_client(client_fd);
-                 _exit(0);
-                } else if (pid>0) {
-                    close(client_fd);
-                
+        for (int i = 0; i < worker_count; ++i) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                free(child_pids);
+                worker_loop(fd);
+                _exit(0);
+            }
+            else if (pid > 0) {
+                child_pids[i] = pid;
+                if (dev_mode) fprintf(stderr, "Spawned worker %d (pid=%d)\n", i, pid);
+            }
+            else perror("fork()");
+        }
+        while (1) {
+            int status;
+            pid_t dead = wait(&status);
+            if (dead <= 0) {
+                if (errno == EINTR) continue;
+                sleep(1);
+                continue;
+            }
+            if (dev_mode) fprintf(stderr, "Worker pid %d exited with status %d, restarting...\n", dead, status);
+            int replaced = 0;
+            for (int i = 0; i < worker_count; ++i) {
+                if (child_pids[i] == dead) {
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        free(child_pids);
+                        worker_loop(fd);
+                        _exit(0);
+                    } else if (pid > 0) {
+                        child_pids[i] = pid;
+                        if (dev_mode) fprintf(stderr, "Replaced worker slot %d with pid %d\n", i, pid);
+                        replaced = 1;
+                        break;
+                    } else perror("fork");
                 }
             }
-                else { 
+            if (!replaced) {
+                if (dev_mode) fprintf(stderr, "Dead pid %d not found; spawning spare worker...\n", dead);
+                pid_t pid = fork();
+                if (pid == 0) {
+                    free(child_pids);
+                    worker_loop(fd);
+                    _exit(0);
+                } else if (pid > 0) {
+                    for (int i = 0; i < worker_count; ++i) {
+                        if (child_pids[i] <= 0) { child_pids[i] = pid; break; }
+                    }
+                } else perror("fork");
+            }
+        }
+    }
+
+    /* fork-per-request mode */
+    if (use_fork) {
+        signal(SIGCHLD, SIG_IGN);
+        fd_set readfds;
+        while (1) {
+            FD_ZERO(&readfds);
+            FD_SET(fd, &readfds);
+            int ready = select(fd + 1, &readfds, NULL, NULL, NULL);
+            if (ready < 0) {
+                if (dev_mode) perror("select()");
+                continue;
+            }
+            if (FD_ISSET(fd, &readfds)) {
+                int client_fd = accept(fd, NULL, NULL);
+                if (client_fd < 0) continue;
+                pid_t pid = fork();
+                if (pid == 0) {
+                    close(fd);
                     if (use_tls) handle_tls_client(client_fd);
                     else handle_http_client(client_fd);
+                    _exit(0);
+                } else if (pid > 0) {
+                    close(client_fd);
+                } else {
+                    if (dev_mode) perror("fork()");
+                    close(client_fd);
                 }
             }
         }
-    
-        if (watch_mode){
-            time_t now = time(NULL);
-            if(zip_override_path && now - last_zip_mtime >=2){
-                struct stat st;
-                if(stat(zip_override_path, &st) == 0 && st.st_mtime != last_zip_mtime){
-                    fprintf(stderr, "[watch] Reloading zip from disk...\n");
-                    FILE *fp = fopen(zip_override_path, "rb");
-                    if(fp){
-                        fseek(fp, 0, SEEK_END);
-                        zip_size = ftell(fp);
-                        fseek(fp, 0, SEEK_SET);
-                        free(zip_data);
-                        zip_data= malloc(zip_size);
-                        fread(zip_data, 1, zip_size, fp);
+    }
+
+    /* watch mode (reload zip/db periodically) */
+    if (watch_mode) {
+        time_t now = time(NULL);
+        if (zip_override_path && now - last_zip_mtime >= 2) {
+            struct stat st;
+            if (stat(zip_override_path, &st) == 0 && st.st_mtime != last_zip_mtime) {
+                fprintf(stderr, "[watch] Reloading zip from disk...\n");
+                FILE *fp = fopen(zip_override_path, "rb");
+                if (fp) {
+                    fseek(fp, 0, SEEK_END);
+                    zip_size = ftell(fp);
+                    fseek(fp, 0, SEEK_SET);
+                    free(zip_data);
+                    zip_data = malloc(zip_size);
+                    fread(zip_data, 1, zip_size, fp);
+                    fclose(fp);
+                    last_zip_mtime = st.st_mtime;
+                    discover_zip_structure();
+                }
+            }
+        }
+        if (use_db && now - last_db_reload >= 2) {
+            const zip_entry_t *db_entry = find_zip_entry("site/data.db");
+            if (db_entry) {
+                size_t db_size;
+                const unsigned char *db_data = extract_file_data(db_entry, &db_size);
+                if (db_data && db_size > 0) {
+                    FILE *fp = fopen("/tmp/macrobean.db", "wb");
+                    if (fp) {
+                        fwrite(db_data, 1, db_size, fp);
                         fclose(fp);
-                        last_zip_mtime = st.st_mtime;
-                        discover_zip_structure();
+                        if (dev_mode) fprintf(stderr, "[watch] Re-extracted site/data.db -> /tmp/macrobean.db\n");
                     }
                 }
             }
-            if (use_db && now - last_db_reload >=2) {
-                const zip_entry_t *db_entry = find_zip_entry("site/data.db");
-                if(db_entry){
-                    size_t db_size;
-                    const unsigned char *db_data = extract_file_data(db_entry, &db_size);
-                    if(db_data && db_size>0)
-                    {
-                        FILE *fp = fopen("/tmp/macrobean.db", "wb");
-                        if(fp){
-                            fwrite(db_data, 1, db_size, fp);
-                            fclose(fp);
-                            if(dev_mode)
-                            fprintf(stderr, "[watch] Re-extracted site/data.db -> /tmp/macrobean.db\n");
-                        }
-                    }
-                }
-                last_db_reload=now;
-            }
+            last_db_reload = now;
         }
-    #ifdef USE_TLS
-    if (use_tls){
+    }
+
+#ifdef USE_TLS
+    if (use_tls) {
         mbedtls_ssl_free(&ssl);
         mbedtls_ssl_config_free(&conf);
         mbedtls_x509_crt_free(&srvcert);
@@ -1483,12 +1645,12 @@ int main(int argc, char **argv) {
         mbedtls_entropy_free(&entropy);
         mbedtls_ctr_drbg_free(&ctr_drbg);
     }
-    #endif
-    if (zip_data) {
-        free(zip_data);
-    }
+#endif
+
+    if (zip_data) free(zip_data);
     return 0;
 }
+
 void serialize_json(lua_State *L, int index, luaL_Buffer *bj){
     if(lua_istable(L, index)){
         int is_array = 1;
