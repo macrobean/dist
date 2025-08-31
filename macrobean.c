@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <signal.h>
+#include <strings.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -63,6 +64,9 @@ int worker_count = 10;
 int worker_max_requests = 1000;
 size_t worker_memory_limit = (10*1024*1024);
 int worker_nofile_limit = 100;
+static time_t server_start_time = 0;
+static unsigned long worker_requests = 0;
+static const char *SERVER_VERSION = "1.0";
 #ifdef USE_TLS
 mbedtls_ssl_context ssl;
 mbedtls_ssl_config conf;
@@ -134,11 +138,47 @@ size_t safe_strlcpy (char *dst, const char *src, size_t size){
     if (size == 0)
     return src_len;
 
-
 size_t copy_len = (src_len >= size)? size - 1 : src_len;
 memcpy(dst, src, copy_len);
 dst[copy_len] = '\0';
 return src_len; 
+}
+
+// JSON string escaper (appends to dst, returns bytes written)
+static size_t json_escape_append(char *dst, size_t cap, const char *s) {
+    size_t off = 0;
+    for (const unsigned char *p = (const unsigned char*)s; *p && off < cap; ++p) {
+        unsigned char c = *p;
+        if (c == '\"' || c == '\\') {
+            if (off + 2 > cap) break;
+            dst[off++] = '\\';
+            dst[off++] = (char)c;
+        }
+        else if (c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t') {
+            if (off + c > cap) break;
+            dst[off++] = '\\';
+            char esc = 'n';
+            switch(c) {
+                case '\b': esc = 'b'; break;
+                case '\f': esc = 'f'; break;
+                case '\n': esc = 'n'; break;
+                case '\r': esc = 'r'; break;
+                case '\t': esc = 't'; break;
+            }
+            dst[off++] = esc;
+        }
+        else if (c < 0x20) {
+            // control chars -> \u00XX
+            if (off + 6 > cap) break;
+            static const char hexdig[] = "0123456789ABCDEF";
+            dst[off++] = '\\'; dst[off++] = 'u'; dst[off++] = '0'; dst[off++] = '0';
+            dst[off++] = hexdig[(c >> 4) & 0xF];
+            dst[off++] = hexdig[c & 0xF];
+        } else {
+            dst[off++] = (char)c;
+        }
+    }
+    return off;
 }
 
 // path canonicalization
@@ -800,23 +840,111 @@ void serve_path(int client_fd, const char *url_path, const char *method, const c
     if (strlen(safe_path) == 0){
         safe_strlcpy(safe_path, "index.html", sizeof(safe_path));
     }
-    if (dev_mode && (strcmp(url_path, "/admin")==0 || strcmp(url_path, "/admin.html")==0)){
-        const zip_entry_t *admin = find_zip_entry ("site/admin.html");
+
+    if (strcmp(safe_path, "api/health") == 0) {
+        time_t now = time(NULL);
+        long up = (server_start_time > 0) ? (long)(now - server_start_time) : 0;
+        pid_t pid = getpid();
+        char mode[16];
+        if (use_workers) safe_strlcpy(mode, "workers", sizeof(mode));
+        else if (use_fork) safe_strlcpy(mode, "fork", sizeof(mode));
+        else safe_strlcpy(mode, "single", sizeof(mode));
+        char buf[1024];
+        int n = snprintf(buf, sizeof(buf),
+    "{"
+        "\"uptime_sec\":%ld,"
+        "\"version\":\"%s\","
+        "\"pid\":%d,"
+        "\"mode\":\"%s\","
+        "\"worker_count\":%d,"
+        "\"requests_served\":%lu,"
+        "\"active_connections\":%d,"
+        "\"zip_files\":%d,"
+        "\"memory_bytes\":%zu,"
+        "\"max_memory_bytes\":%zu,"
+        "\"tls\":%s"
+        "}",
+        up, SERVER_VERSION, (int)pid, mode, worker_count, worker_requests, active_connections,
+        zip_entry_cnt, total_allocated, max_memory_used, use_tls ? "true" : "false");
+
+        http_response_t resp = (http_response_t) {0};
+        resp.status_code = 200;
+        safe_strlcpy(resp.content_type, "applications/json; charset = utf-8", sizeof(resp.content_type));
+        resp.body = (char*)buf;
+        resp.body_length = (n>0) ? (size_t)n : 0;
+        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+        if (strcasecmp(method, "HEAD") == 0) resp.body = NULL; 
+        send_http_response(client_fd, &resp);
+        return;
+    }
+
+    if (strcmp(safe_path, "api/files") == 0) {
+        size_t cap = 64 + (size_t)zip_entry_cnt * (6*(size_t)MAX_PATH + 4);
+        if (cap > (MAX_MEMORY_USAGE - 1024)) cap = (MAX_MEMORY_USAGE - 1024);
+        char *buf = (char*)safe_malloc(cap);
+        if (!buf) { send_error_response(client_fd, 503, "Not enough memory to build JSON"); return; }
+        size_t off = 0;
+        off += snprintf(buf + off, cap - off, "{\"files\":[");
+        for (int i = 0; i < zip_entry_cnt && off < cap; ++i) {
+            if (i > 0 && off < cap) buf[off++] = ',';
+            if (off < cap) buf[off++] = '"';
+            off += json_escape_append(buf+off, (off<cap ? cap - off : 0), zip_contents[i].filename);
+            if (off < cap) buf[off++] = '"';
+        }
+    if (off + 2 < cap) { buf[off++] = ']'; buf[off++] = '}'; }
+        size_t total = off;
+        http_response_t resp = (http_response_t){0};
+        resp.status_code = 200;
+        safe_strlcpy(resp.content_type, "application/json; charset=utf-8", sizeof(resp.content_type));
+        resp.body = (char*)buf;
+        resp.body_length = total;
+        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+        if (strcasecmp(method, "HEAD") == 0) resp.body = NULL; // send headers only
+        send_http_response(client_fd, &resp);
+        safe_free(buf, cap);
+    return;
+    }
+
+//     if (dev_mode && (strcmp(url_path, "/admin")==0 || strcmp(url_path, "/admin.html")==0)){
+//         const zip_entry_t *admin = find_zip_entry ("site/admin.html");
+//         if (!admin) {
+//             const char *err = "HTTP/1.1 404 Not Found\r\n\r\nsite/admin.html not found in ZIP.";
+//             write(client_fd, err, strlen(err));
+//             return;
+//         }
+//         size_t size;
+//         const unsigned char *data = extract_file_data(admin, &size);
+//         const char *mime = "text/html";
+//         char header[512];
+//         snprintf(header, sizeof(header),
+//     "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n\r\n",
+// mime, size);
+// write(client_fd, header, strlen(header));
+// write(client_fd, data, size);
+// return;
+//     }
+
+    if ((strcmp(url_path, "/admin") == 0) || (strcmp(url_path, "/admin.html") == 0)) {
+        if (!dev_mode) {
+            send_error_response(client_fd, 403, "Admin panel is disabled outside dev mode");
+            return;
+        }
+        const zip_entry_t *admin = find_zip_entry("*/admin.html");
         if (!admin) {
-            const char *err = "HTTP/1.1 404 Not Found\r\n\r\nsite/admin.html not found in ZIP.";
-            write(client_fd, err, strlen(err));
+            send_error_response(client_fd, 404, "*/admin.html not found in ZIP.");
             return;
         }
         size_t size;
         const unsigned char *data = extract_file_data(admin, &size);
-        const char *mime = "text/html";
-        char header[512];
-        snprintf(header, sizeof(header),
-    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\n\r\n",
-mime, size);
-write(client_fd, header, strlen(header));
-write(client_fd, data, size);
-return;
+        http_response_t resp = (http_response_t){0};
+        resp.status_code = 200;
+        safe_strlcpy(resp.content_type, "text/html; charset=utf-8", sizeof(resp.content_type));
+        resp.body = (char*)data;
+        resp.body_length = size;
+        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Contrl: no-store", MAX_HEADER_SIZE);
+        safe_strlcpy(resp.headers[resp.header_count++], "X-Robots-Tag: noindex", MAX_HEADER_SIZE);
+        send_http_response(client_fd, &resp);
+        return;
     }
     char clean_path[MAX_PATH];
     // if (url_path[0] == '/') {
@@ -1279,6 +1407,7 @@ void handle_tls_client(int client_fd){
             }
             body[content_length]='\0';
         }
+        worker_requests++;
         serve_path(client_fd, path, method, body);
         if (body) free(body);
     }
@@ -1368,6 +1497,7 @@ void handle_http_client(int client_fd) {
         if (dev_mode) {
             printf("Request: %s %s from %s\n", req.method, req.path, client_ip);
         }
+    worker_requests++;
     serve_path (client_fd, req.path, req.method, req.body);
     free_http_request(&req);
     close(client_fd);
@@ -1452,6 +1582,7 @@ int main(int argc, char **argv) {
 #endif
 
     printf("Running Macrobean Server\n");
+    server_start_time = time(NULL);
     if (dev_mode) printf("Extracting embedded content...\n");
 
     /* load ZIP data */
