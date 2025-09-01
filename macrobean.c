@@ -585,6 +585,67 @@ const zip_entry_t* find_best_match(const char *requested_path) {
         if (strcmp(filename, requested_path) == 0) return &zip_contents[i];
      } return NULL;
 }
+void serialize_json(lua_State *L, int index, luaL_Buffer *bj){
+    if(lua_istable(L, index)){
+        int is_array = 1;
+        lua_pushnil(L);
+        while(lua_next(L, index)){
+            if(!lua_isinteger(L, -2)){
+                is_array=0;
+                lua_pop(L,2);
+                break;
+            }
+            lua_pop(L,1);
+        }
+        if(is_array){
+            luaL_addchar(bj, '[');
+            int n=lua_rawlen(L, index);
+            for(int i=1;i<=n;i++){
+                lua_rawgeti(L, index, i);
+                serialize_json(L, lua_gettop(L), bj);
+                lua_pop(L, 1);
+                if(i<n) luaL_addchar(bj, ',');
+            }
+            luaL_addchar(bj, ']');
+        } else{
+            luaL_addchar(bj, '{');
+            int first = 1;
+            lua_pushnil(L);
+            while(lua_next(L, index)){
+                if(!first) luaL_addchar(bj, ',');
+                first = 0;
+                lua_pushvalue(L,-2);
+                size_t klen;
+                const char *key = lua_tolstring(L, -1, &klen);
+                luaL_addchar(bj, '"');
+                luaL_addlstring(bj, key, klen);
+                luaL_addstring(bj, "\":");
+                lua_pop(L,1);
+                serialize_json(L, lua_gettop(L), bj);
+                lua_pop(L, 1);
+            }
+            luaL_addchar(bj , '}');
+        }
+    }else if(lua_isstring(L, index)){
+            size_t len;
+            const char *s = lua_tolstring(L, index, &len);
+            luaL_addchar(bj, '"');
+            luaL_addlstring(bj, s, len);
+            luaL_addchar(bj, '"');
+
+
+        } else if(lua_isboolean(L, index)){
+            luaL_addstring(bj, lua_toboolean(L, index) ? "true" : "false");
+        } else if (lua_isnil(L, index)) {
+            luaL_addstring(bj, "null");
+        }else if (lua_isnumber(L, index)){
+            char num[32];
+            snprintf(num, sizeof(num), "%g", lua_tonumber(L, index));
+            luaL_addstring(bj, num);
+        } else {
+            luaL_addstring(bj, "\"<unsupported>\"");
+        }
+}
 
 const char* guess_content_type(const char *path) {  
     const char *ext = strrchr(path, '.');
@@ -1698,7 +1759,7 @@ int main(int argc, char **argv) {
     }
 
     /* fork-per-request mode */
-    if (use_fork) {
+    else if (use_fork) {
         signal(SIGCHLD, SIG_IGN);
         fd_set readfds;
         while (1) {
@@ -1727,8 +1788,27 @@ int main(int argc, char **argv) {
             }
         }
     }
-
-    /* watch mode (reload zip/db periodically) */
+    else {
+        // Single-process mode (no fork, no workers)
+        fd_set readfds;
+        while (1) {
+            FD_ZERO(&readfds);
+            FD_SET(fd, &readfds);
+            int ready = select(fd+1, &readfds, NULL, NULL, NULL);
+            if (ready < 0) {
+                if (dev_mode) perror("select()");
+                continue;
+            }
+            if (FD_ISSET(fd, &readfds)) {
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_len);
+                if (client_fd < 0) continue;
+                if (use_tls) handle_tls_client(client_fd);
+                else handle_http_client(client_fd);
+                close(client_fd);
+            }
+            /* watch mode (reload zip/db periodically) */
     if (watch_mode) {
         time_t now = time(NULL);
         if (zip_override_path && now - last_zip_mtime >= 2) {
@@ -1767,6 +1847,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    }
+}
+
+
 #ifdef USE_TLS
     if (use_tls) {
         mbedtls_ssl_free(&ssl);
@@ -1780,66 +1864,4 @@ int main(int argc, char **argv) {
 
     if (zip_data) free(zip_data);
     return 0;
-}
-
-void serialize_json(lua_State *L, int index, luaL_Buffer *bj){
-    if(lua_istable(L, index)){
-        int is_array = 1;
-        lua_pushnil(L);
-        while(lua_next(L, index)){
-            if(!lua_isinteger(L, -2)){
-                is_array=0;
-                lua_pop(L,2);
-                break;
-            }
-            lua_pop(L,1);
-        }
-        if(is_array){
-            luaL_addchar(bj, '[');
-            int n=lua_rawlen(L, index);
-            for(int i=1;i<=n;i++){
-                lua_rawgeti(L, index, i);
-                serialize_json(L, lua_gettop(L), bj);
-                lua_pop(L, 1);
-                if(i<n) luaL_addchar(bj, ',');
-            }
-            luaL_addchar(bj, ']');
-        } else{
-            luaL_addchar(bj, '{');
-            int first = 1;
-            lua_pushnil(L);
-            while(lua_next(L, index)){
-                if(!first) luaL_addchar(bj, ',');
-                first = 0;
-                lua_pushvalue(L,-2);
-                size_t klen;
-                const char *key = lua_tolstring(L, -1, &klen);
-                luaL_addchar(bj, '"');
-                luaL_addlstring(bj, key, klen);
-                luaL_addstring(bj, "\":");
-                lua_pop(L,1);
-                serialize_json(L, lua_gettop(L), bj);
-                lua_pop(L, 1);
-            }
-            luaL_addchar(bj , '}');
-        }
-    }else if(lua_isstring(L, index)){
-            size_t len;
-            const char *s = lua_tolstring(L, index, &len);
-            luaL_addchar(bj, '"');
-            luaL_addlstring(bj, s, len);
-            luaL_addchar(bj, '"');
-
-
-        } else if(lua_isboolean(L, index)){
-            luaL_addstring(bj, lua_toboolean(L, index) ? "true" : "false");
-        } else if (lua_isnil(L, index)) {
-            luaL_addstring(bj, "null");
-        }else if (lua_isnumber(L, index)){
-            char num[32];
-            snprintf(num, sizeof(num), "%g", lua_tonumber(L, index));
-            luaL_addstring(bj, num);
-        } else {
-            luaL_addstring(bj, "\"<unsupported>\"");
-        }
 }
