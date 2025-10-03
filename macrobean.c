@@ -930,7 +930,7 @@ void serve_path(int client_fd, const char *url_path, const char *method, const c
 
         http_response_t resp = (http_response_t) {0};
         resp.status_code = 200;
-        safe_strlcpy(resp.content_type, "applications/json; charset = utf-8", sizeof(resp.content_type));
+        safe_strlcpy(resp.content_type, "application/json; charset = utf-8", sizeof(resp.content_type));
         resp.body = (char*)buf;
         resp.body_length = (n>0) ? (size_t)n : 0;
         safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
@@ -1002,7 +1002,7 @@ void serve_path(int client_fd, const char *url_path, const char *method, const c
         safe_strlcpy(resp.content_type, "text/html; charset=utf-8", sizeof(resp.content_type));
         resp.body = (char*)data;
         resp.body_length = size;
-        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Contrl: no-store", MAX_HEADER_SIZE);
+        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
         safe_strlcpy(resp.headers[resp.header_count++], "X-Robots-Tag: noindex", MAX_HEADER_SIZE);
         send_http_response(client_fd, &resp);
         return;
