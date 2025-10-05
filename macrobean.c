@@ -79,6 +79,24 @@ mbedtls_ctr_drbg_context ctr_drbg;
 static size_t total_allocated = 0;
 static size_t max_memory_used = 0;
 
+typedef int (*route_handler_t)(int client_fd, const char *method, const char *path);
+typedef struct {
+    const char *path;
+    route_handler_t handler;
+    int dev_only;
+} route_entry_t;
+
+static int handle_api_health(int client_fd, const char *method, const char *path);
+static int handle_api_files(int client_fd, const char *method, const char *path);
+static int handle_admin(int client_fd, const char *method, const char *path);
+static route_entry_t builtin_routes[] = {
+    {"/api/health", handle_api_health, 1},
+    {"/api/files", handle_api_files, 1},
+    {"/admin", handle_admin, 1},
+    {"/admin.html", handle_admin, 1},
+    {NULL, NULL, 0}     
+};
+
 // request parsing and validation structures
 typedef struct {
     char method[16];
@@ -180,6 +198,7 @@ static size_t json_escape_append(char *dst, size_t cap, const char *s) {
     }
     return off;
 }
+
 
 // path canonicalization
 
@@ -394,20 +413,6 @@ void send_http_response(int client_fd, http_response_t *resp) {
     write(client_fd, resp->body, resp->body_length);
 }
 
-// Enhanced error response
-void send_error_response(int client_fd, int status_code, const char *message){
-    http_response_t resp = {0};
-    resp.status_code = status_code;
-    safe_strlcpy(resp.content_type, "text/plain", sizeof(resp.content_type));
-    char error_body[512];
-    int body_len = snprintf(error_body, sizeof(error_body),
-                            "Error %d: %s", status_code, message ?
-                        message : "Unknown error");
-    resp.body = error_body;
-    resp.body_length = body_len;
-    send_http_response(client_fd, &resp);
-}
-
 #ifdef USE_TLS
 void handle_tls_client(int client_fd);
 #endif
@@ -427,6 +432,15 @@ typedef struct {
 
 zip_entry_t zip_contents[MAX_FILES];
 int zip_entry_cnt = 0;
+
+const zip_entry_t* find_zip_entry(const char *path) {
+    for (int i = 0; i < zip_entry_cnt; i++) {
+        if (strcmp(zip_contents[i].filename, path) == 0) {
+            return &zip_contents[i];
+        }
+    }
+    return NULL;
+}
 
 const unsigned char *extract_file_data(const zip_entry_t *entry, size_t *out_size) {
     if ((entry->cmpr_method != 0) && (dev_mode)) {
@@ -462,6 +476,103 @@ const unsigned char *extract_file_data(const zip_entry_t *entry, size_t *out_siz
     
     *out_size = entry->size;
     return file_data;
+}
+
+// Enhanced error response
+void send_error_response(int client_fd, int status_code, const char *message){
+    http_response_t resp = {0};
+    resp.status_code = status_code;
+    safe_strlcpy(resp.content_type, "text/plain", sizeof(resp.content_type));
+    char error_body[512];
+    int body_len = snprintf(error_body, sizeof(error_body),
+                            "Error %d: %s", status_code, message ?
+                        message : "Unknown error");
+    resp.body = error_body;
+    resp.body_length = body_len;
+    send_http_response(client_fd, &resp);
+}
+
+static int handle_api_health(int client_fd, const char *method, const char *path){
+    if (!dev_mode) { send_error_response(client_fd, 403, "Forbidden"); return 1;}
+    time_t now = time(NULL);
+    long up = (server_start_time > 0) ? (long)(now - server_start_time) : 0;
+    pid_t pid = getpid();
+    char mode[16];
+    if (use_workers) safe_strlcpy(mode, "workers", sizeof(mode));
+    else if (use_fork) safe_strlcpy(mode, "fork", sizeof(mode));
+    else safe_strlcpy(mode, "single", sizeof(mode));
+
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf),
+        "{"
+         "\"uptime_sec\":%ld,"
+          "\"version\":\"%s\","
+          "\"pid\":%d,"
+          "\"mode\":\"%s\","
+          "\"worker_count\":%d,"
+          "\"requests_served\":%lu,"
+          "\"active_connections\":%d,"
+          "\"zip_files\":%d,"
+          "\"memory_bytes\":%zu,"
+          "\"max_memory_bytes\":%zu,"
+          "\"tls\":%s"
+        "}",
+        up, SERVER_VERSION, (int)pid, mode, worker_count, worker_requests,
+        active_connections, zip_entry_cnt, total_allocated, max_memory_used,
+        use_tls ? "true" : "false");
+    
+    http_response_t resp = (http_response_t){0};
+    resp.status_code = 200;
+    safe_strlcpy(resp.content_type, "application/json; charset=utf-8", sizeof(resp.content_type));
+    resp.body = (char*)buf;
+    resp.body_length = (n > 0) ? (size_t)n : 0;
+    safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+    if (strcasecmp(method, "HEAD") == 0) resp.body = NULL;
+    send_http_response(client_fd, &resp);
+    return 0;
+}
+
+static int handle_api_files(int client_fd, const char *method, const char *path){
+if (!dev_mode) { send_error_response(client_fd, 403, "Forbidden"); return 1; }
+size_t cap = 128 + (size_t)zip_entry_cnt * (6*(size_t)MAX_PATH + 4);
+char *buf = (char*)safe_malloc(cap);
+if (!buf) { send_error_response(client_fd, 503, "Not enough memory"); return 1; }
+size_t off = 0;
+off += snprintf(buf + off, cap - off, "{\"files\":[");
+for (int i = 0; i < zip_entry_cnt && off < cap; ++i) {
+    if (i > 0 && off < cap) buf[off++] = ',';
+    if (off < cap) buf[off++] = '"';
+    off += json_escape_append(buf + off, (off < cap ? cap - off : 0), zip_contents[i].filename);
+    if (off < cap) buf[off++] = '"';
+}
+if (off + 2 < cap) { buf[off++] = ']'; buf[off++] = '}'; }
+size_t total = off;
+http_response_t resp = (http_response_t){0};
+resp.status_code = 200;
+safe_strlcpy(resp.content_type, "applications/json; charset=utf-8", sizeof(resp.content_type));
+resp.body = (char*)buf;
+resp.body_length = total;
+safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+if (strcasecmp(method, "HEAD") == 0) resp.body = NULL;
+send_http_response(client_fd, &resp);
+safe_free(buf, cap);
+return 0;
+}
+
+static int handle_admin(int client_fd, const char *method, const char *path){
+    if (!dev_mode) { send_error_response(client_fd, 403, "Admin disabled outside dev mode"); return 1; } // site/admin.html -> */admin.html
+    const zip_entry_t *admin = find_zip_entry("site/admin.html");
+    size_t size;
+    const unsigned char *data = extract_file_data(admin, &size);
+    http_response_t resp = (http_response_t){0};
+    resp.status_code = 200;
+    safe_strlcpy(resp.content_type, "text/html; charset=utf-8", sizeof(resp.content_type));
+    resp.body = (char*)data;
+    resp.body_length = size;
+    safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+    safe_strlcpy(resp.headers[resp.header_count++], "X-Robots-Tag: noindex", MAX_HEADER_SIZE);
+    send_http_response(client_fd, &resp);
+    return 0;
 }
 
 void discover_zip_structure() {
@@ -549,15 +660,6 @@ void discover_zip_structure() {
         }
         cd_ptr += 46 + filename_len + extra_len + comment_len;
 }
-}
-
-const zip_entry_t* find_zip_entry(const char *path) {
-    for (int i = 0; i < zip_entry_cnt; i++) {
-        if (strcmp(zip_contents[i].filename, path) == 0) {
-            return &zip_contents[i];
-        }
-    }
-    return NULL;
 }
 
 const zip_entry_t* find_best_match(const char *requested_path) {
@@ -902,69 +1004,69 @@ void serve_path(int client_fd, const char *url_path, const char *method, const c
         safe_strlcpy(safe_path, "index.html", sizeof(safe_path));
     }
 
-    if (strcmp(safe_path, "api/health") == 0) {
-        time_t now = time(NULL);
-        long up = (server_start_time > 0) ? (long)(now - server_start_time) : 0;
-        pid_t pid = getpid();
-        char mode[16];
-        if (use_workers) safe_strlcpy(mode, "workers", sizeof(mode));
-        else if (use_fork) safe_strlcpy(mode, "fork", sizeof(mode));
-        else safe_strlcpy(mode, "single", sizeof(mode));
-        char buf[1024];
-        int n = snprintf(buf, sizeof(buf),
-    "{"
-        "\"uptime_sec\":%ld,"
-        "\"version\":\"%s\","
-        "\"pid\":%d,"
-        "\"mode\":\"%s\","
-        "\"worker_count\":%d,"
-        "\"requests_served\":%lu,"
-        "\"active_connections\":%d,"
-        "\"zip_files\":%d,"
-        "\"memory_bytes\":%zu,"
-        "\"max_memory_bytes\":%zu,"
-        "\"tls\":%s"
-        "}",
-        up, SERVER_VERSION, (int)pid, mode, worker_count, worker_requests, active_connections,
-        zip_entry_cnt, total_allocated, max_memory_used, use_tls ? "true" : "false");
+    // if (strcmp(safe_path, "api/health") == 0) {
+    //     time_t now = time(NULL);
+    //     long up = (server_start_time > 0) ? (long)(now - server_start_time) : 0;
+    //     pid_t pid = getpid();
+    //     char mode[16];
+    //     if (use_workers) safe_strlcpy(mode, "workers", sizeof(mode));
+    //     else if (use_fork) safe_strlcpy(mode, "fork", sizeof(mode));
+    //     else safe_strlcpy(mode, "single", sizeof(mode));
+    //     char buf[1024];
+    //     int n = snprintf(buf, sizeof(buf),
+    // "{"
+    //     "\"uptime_sec\":%ld,"
+    //     "\"version\":\"%s\","
+    //     "\"pid\":%d,"
+    //     "\"mode\":\"%s\","
+    //     "\"worker_count\":%d,"
+    //     "\"requests_served\":%lu,"
+    //     "\"active_connections\":%d,"
+    //     "\"zip_files\":%d,"
+    //     "\"memory_bytes\":%zu,"
+    //     "\"max_memory_bytes\":%zu,"
+    //     "\"tls\":%s"
+    //     "}",
+    //     up, SERVER_VERSION, (int)pid, mode, worker_count, worker_requests, active_connections,
+    //     zip_entry_cnt, total_allocated, max_memory_used, use_tls ? "true" : "false");
 
-        http_response_t resp = (http_response_t) {0};
-        resp.status_code = 200;
-        safe_strlcpy(resp.content_type, "application/json; charset = utf-8", sizeof(resp.content_type));
-        resp.body = (char*)buf;
-        resp.body_length = (n>0) ? (size_t)n : 0;
-        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
-        if (strcasecmp(method, "HEAD") == 0) resp.body = NULL; 
-        send_http_response(client_fd, &resp);
-        return;
-    }
+    //     http_response_t resp = (http_response_t) {0};
+    //     resp.status_code = 200;
+    //     safe_strlcpy(resp.content_type, "application/json; charset = utf-8", sizeof(resp.content_type));
+    //     resp.body = (char*)buf;
+    //     resp.body_length = (n>0) ? (size_t)n : 0;
+    //     safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+    //     if (strcasecmp(method, "HEAD") == 0) resp.body = NULL; 
+    //     send_http_response(client_fd, &resp);
+    //     return;
+    // }
 
-    if (strcmp(safe_path, "api/files") == 0) {
-        size_t cap = 64 + (size_t)zip_entry_cnt * (6*(size_t)MAX_PATH + 4);
-        if (cap > (MAX_MEMORY_USAGE - 1024)) cap = (MAX_MEMORY_USAGE - 1024);
-        char *buf = (char*)safe_malloc(cap);
-        if (!buf) { send_error_response(client_fd, 503, "Not enough memory to build JSON"); return; }
-        size_t off = 0;
-        off += snprintf(buf + off, cap - off, "{\"files\":[");
-        for (int i = 0; i < zip_entry_cnt && off < cap; ++i) {
-            if (i > 0 && off < cap) buf[off++] = ',';
-            if (off < cap) buf[off++] = '"';
-            off += json_escape_append(buf+off, (off<cap ? cap - off : 0), zip_contents[i].filename);
-            if (off < cap) buf[off++] = '"';
-        }
-    if (off + 2 < cap) { buf[off++] = ']'; buf[off++] = '}'; }
-        size_t total = off;
-        http_response_t resp = (http_response_t){0};
-        resp.status_code = 200;
-        safe_strlcpy(resp.content_type, "application/json; charset=utf-8", sizeof(resp.content_type));
-        resp.body = (char*)buf;
-        resp.body_length = total;
-        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
-        if (strcasecmp(method, "HEAD") == 0) resp.body = NULL; // send headers only
-        send_http_response(client_fd, &resp);
-        safe_free(buf, cap);
-    return;
-    }
+    // if (strcmp(safe_path, "api/files") == 0) {
+    //     size_t cap = 64 + (size_t)zip_entry_cnt * (6*(size_t)MAX_PATH + 4);
+    //     if (cap > (MAX_MEMORY_USAGE - 1024)) cap = (MAX_MEMORY_USAGE - 1024);
+    //     char *buf = (char*)safe_malloc(cap);
+    //     if (!buf) { send_error_response(client_fd, 503, "Not enough memory to build JSON"); return; }
+    //     size_t off = 0;
+    //     off += snprintf(buf + off, cap - off, "{\"files\":[");
+    //     for (int i = 0; i < zip_entry_cnt && off < cap; ++i) {
+    //         if (i > 0 && off < cap) buf[off++] = ',';
+    //         if (off < cap) buf[off++] = '"';
+    //         off += json_escape_append(buf+off, (off<cap ? cap - off : 0), zip_contents[i].filename);
+    //         if (off < cap) buf[off++] = '"';
+    //     }
+    // if (off + 2 < cap) { buf[off++] = ']'; buf[off++] = '}'; }
+    //     size_t total = off;
+    //     http_response_t resp = (http_response_t){0};
+    //     resp.status_code = 200;
+    //     safe_strlcpy(resp.content_type, "application/json; charset=utf-8", sizeof(resp.content_type));
+    //     resp.body = (char*)buf;
+    //     resp.body_length = total;
+    //     safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+    //     if (strcasecmp(method, "HEAD") == 0) resp.body = NULL; // send headers only
+    //     send_http_response(client_fd, &resp);
+    //     safe_free(buf, cap);
+    // return;
+    // }
 
 //     if (dev_mode && (strcmp(url_path, "/admin")==0 || strcmp(url_path, "/admin.html")==0)){
 //         const zip_entry_t *admin = find_zip_entry ("site/admin.html");
@@ -985,28 +1087,41 @@ void serve_path(int client_fd, const char *url_path, const char *method, const c
 // return;
 //     }
 
-    if ((strcmp(url_path, "/admin") == 0) || (strcmp(url_path, "/admin.html") == 0)) {
-        if (!dev_mode) {
-            send_error_response(client_fd, 403, "Admin panel is disabled outside dev mode");
+    // if ((strcmp(url_path, "/admin") == 0) || (strcmp(url_path, "/admin.html") == 0)) {
+    //     if (!dev_mode) {
+    //         send_error_response(client_fd, 403, "Admin panel is disabled outside dev mode");
+    //         return;
+    //     }
+    //     const zip_entry_t *admin = find_zip_entry("*/admin.html");
+    //     if (!admin) {
+    //         send_error_response(client_fd, 404, "*/admin.html not found in ZIP.");
+    //         return;
+    //     }
+    //     size_t size;
+    //     const unsigned char *data = extract_file_data(admin, &size);
+    //     http_response_t resp = (http_response_t){0};
+    //     resp.status_code = 200;
+    //     safe_strlcpy(resp.content_type, "text/html; charset=utf-8", sizeof(resp.content_type));
+    //     resp.body = (char*)data;
+    //     resp.body_length = size;
+    //     safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
+    //     safe_strlcpy(resp.headers[resp.header_count++], "X-Robots-Tag: noindex", MAX_HEADER_SIZE);
+    //     send_http_response(client_fd, &resp);
+    //     return;
+    // }
+
+    // BUILT-IN ROUTING
+    for (route_entry_t *r = builtin_routes; r->path; r++) {
+        if (strcmp(url_path, r->path) == 0) {
+            if (r->dev_only && !dev_mode) {
+                send_error_response(client_fd, 403, "Forbidden");
+                return;
+            }
+            r->handler(client_fd, method, url_path);
             return;
         }
-        const zip_entry_t *admin = find_zip_entry("*/admin.html");
-        if (!admin) {
-            send_error_response(client_fd, 404, "*/admin.html not found in ZIP.");
-            return;
-        }
-        size_t size;
-        const unsigned char *data = extract_file_data(admin, &size);
-        http_response_t resp = (http_response_t){0};
-        resp.status_code = 200;
-        safe_strlcpy(resp.content_type, "text/html; charset=utf-8", sizeof(resp.content_type));
-        resp.body = (char*)data;
-        resp.body_length = size;
-        safe_strlcpy(resp.headers[resp.header_count++], "Cache-Control: no-store", MAX_HEADER_SIZE);
-        safe_strlcpy(resp.headers[resp.header_count++], "X-Robots-Tag: noindex", MAX_HEADER_SIZE);
-        send_http_response(client_fd, &resp);
-        return;
     }
+
     char clean_path[MAX_PATH];
     // if (url_path[0] == '/') {
     //     strcpy(clean_path, url_path + 1);
